@@ -8,6 +8,7 @@ import torch.nn as nn
 from vllm.config.model import LogprobsMode
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
@@ -224,6 +225,23 @@ class Sampler(nn.Module):
             selected_token_ranks=token_ranks,
         )
 
+    def _can_defer_temperature(self, sampling_metadata: SamplingMetadata) -> bool:
+        """Whether temperature scaling can be deferred into the sampler.
+
+        Active argmax-invariant logits processors (e.g. min-p) must observe
+        temperature-scaled logits, so they disable deferral.
+        """
+        if not self.topk_topp_sampler.supports_fused_temperature:
+            return False
+        for processor in sampling_metadata.logitsprocs.argmax_invariant:
+            if isinstance(processor, MinPLogitsProcessor):
+                if processor.min_p_count:
+                    return False
+            else:
+                # Unknown (e.g. out-of-tree) processor: be conservative.
+                return False
+        return True
+
     @staticmethod
     def apply_temperature(
         logits: torch.Tensor,
@@ -272,23 +290,36 @@ class Sampler(nn.Module):
 
         assert sampling_metadata.temperature is not None
 
-        # Apply temperature.
-        logits = self.apply_temperature(
-            logits, sampling_metadata.temperature, sampling_metadata.all_random
-        )
+        if self._can_defer_temperature(sampling_metadata):
+            temp = sampling_metadata.temperature
+            # Avoid division by zero if there are greedy requests.
+            if not sampling_metadata.all_random:
+                temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
+            random_sampled, processed_logprobs = self.topk_topp_sampler(
+                logits,
+                sampling_metadata.generators,
+                sampling_metadata.top_k,
+                sampling_metadata.top_p,
+                temperature=temp,
+            )
+        else:
+            # Apply temperature.
+            logits = self.apply_temperature(
+                logits, sampling_metadata.temperature, sampling_metadata.all_random
+            )
 
-        # Apply logits processors that only apply to random sampling
-        # (argmax invariant)
-        for processor in sampling_metadata.logitsprocs.argmax_invariant:
-            logits = processor.apply(logits)
+            # Apply logits processors that only apply to random sampling
+            # (argmax invariant)
+            for processor in sampling_metadata.logitsprocs.argmax_invariant:
+                logits = processor.apply(logits)
 
-        # Apply top_k and/or top_p.
-        random_sampled, processed_logprobs = self.topk_topp_sampler(
-            logits,
-            sampling_metadata.generators,
-            sampling_metadata.top_k,
-            sampling_metadata.top_p,
-        )
+            # Apply top_k and/or top_p.
+            random_sampled, processed_logprobs = self.topk_topp_sampler(
+                logits,
+                sampling_metadata.generators,
+                sampling_metadata.top_k,
+                sampling_metadata.top_p,
+            )
 
         if greedy_sampled is None:
             return random_sampled, processed_logprobs

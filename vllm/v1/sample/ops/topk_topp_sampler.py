@@ -83,6 +83,9 @@ class TopKTopPSampler(nn.Module):
         super().__init__()
         self.logprobs_mode = logprobs_mode
         self.use_fp64_gumbel = use_fp64_gumbel
+        # Whether forward supports deferred temperature scaling (see
+        # forward_cuda).
+        self.supports_fused_temperature = False
         if current_platform.is_cuda():
             # FlashInfer doesn't expose post-top-k/top-p logits/logprobs,
             # so it can't be used when the configured mode requires them.
@@ -93,6 +96,7 @@ class TopKTopPSampler(nn.Module):
             self.forward = (
                 self.forward_cuda if can_use_flashinfer else self.forward_native
             )
+            self.supports_fused_temperature = can_use_flashinfer
         elif current_platform.is_cpu():
             arch = current_platform.get_cpu_architecture()
             # Fall back to native implementation for POWERPC and RISCV.
@@ -150,20 +154,22 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        temperature: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling."""
         # Fall back to the PyTorch-native path when FlashInfer has nothing
-        # to do (no top-k / top-p filter) or when per-request generators
-        # are present (unsupported by FlashInfer 0.2.3+).
-        if (k is None and p is None) or generators:
+        # to do (no top-k / top-p filter), when per-request generators are
+        # present (unsupported by FlashInfer 0.2.3+), or when fp64 Gumbel
+        # noise is requested.
+        if (k is None and p is None) or generators or self.use_fp64_gumbel:
             if generators:
                 logger.debug_once(
                     "FlashInfer 0.2.3+ does not support "
                     "per-request generators. Falling back to "
                     "PyTorch-native implementation."
                 )
-            return self.forward_native(logits, generators, k, p)
-        if self.use_fp64_gumbel:
+            if temperature is not None:
+                logits = logits.div_(temperature.unsqueeze(dim=1))
             return self.forward_native(logits, generators, k, p)
         assert self.logprobs_mode not in ("processed_logits", "processed_logprobs"), (
             "FlashInfer does not support returning logits/logprobs"
@@ -171,7 +177,9 @@ class TopKTopPSampler(nn.Module):
         # flashinfer sampling functions expect contiguous logits.
         # In flex_attn/triton_attn fp32 inference, logits can be non-contiguous
         # because of slicing operation in logits_processor.
-        return flashinfer_sample(logits.contiguous(), k, p, generators), None
+        return flashinfer_sample(
+            logits.contiguous(), k, p, generators, temperature
+        ), None
 
     def forward_cpu(
         self,
@@ -473,6 +481,7 @@ def flashinfer_sample(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     generators: dict[int, torch.Generator] = {},  # noqa
+    temperature: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample from the logits using FlashInfer.
 
@@ -483,11 +492,28 @@ def flashinfer_sample(
     NOTE: The outputs of this function do not necessarily match the outputs of
     the `random_sample` function. It only guarantees that the outputs are
     statistically equivalent.
+
+    A non-``None`` ``temperature`` must be positive and not already
+    applied to ``logits``; the division is fused into FlashInfer's softmax.
     """
     import flashinfer
 
     assert not (k is None and p is None)
-    if k is None:
+    if temperature is not None:
+        probs = flashinfer.sampling.softmax(logits, temperature=temperature)
+        if k is None:
+            next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, p, deterministic=True
+            )
+        elif p is None:
+            next_token_ids = flashinfer.sampling.top_k_sampling_from_probs(
+                probs, k, deterministic=True
+            )
+        else:
+            next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, k, p, deterministic=True
+            )
+    elif k is None:
         # Top-p only.
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(

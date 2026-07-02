@@ -1015,6 +1015,72 @@ class TestFlashInferDistributionMatch:
             label=f"native top-k={topk} top-p={topp}",
         )
 
+    @pytest.mark.parametrize(
+        "topk,topp",
+        [
+            (8, None),
+            (None, 0.7),
+            (8, 0.9),
+        ],
+    )
+    @pytest.mark.parametrize("temperature", [0.5, 1.5])
+    def test_fused_temperature_matches_theoretical(self, topk, topp, temperature):
+        import flashinfer
+        from scipy.stats import chisquare
+
+        from vllm.v1.sample.ops.topk_topp_sampler import flashinfer_sample
+
+        torch.set_default_device(DEVICE_TYPE)
+        torch.manual_seed(self.SEED)
+
+        # Same logits row used for both paths so the comparison is fair.
+        logits_one = (
+            torch.randn(
+                (1, self.VOCAB),
+                dtype=torch.float32,
+            )
+            * 2.0
+        )
+        temp_one = torch.tensor([temperature], dtype=torch.float32)
+
+        # The fused softmax must match the softmax of pre-scaled logits.
+        fused_probs = flashinfer.sampling.softmax(logits_one, temperature=temp_one)
+        ref_probs = (logits_one / temperature).softmax(dim=-1)
+        torch.testing.assert_close(fused_probs, ref_probs, atol=1e-5, rtol=0)
+
+        # Theoretical expected distribution from PyTorch-native filter.
+        k_one = torch.tensor([topk], dtype=torch.int32) if topk is not None else None
+        p_one = torch.tensor([topp], dtype=torch.float32) if topp is not None else None
+        masked = apply_top_k_top_p_pytorch(logits_one / temperature, k_one, p_one)
+        expected_probs = masked.softmax(dim=-1).flatten().cpu().numpy()
+        expected_counts = expected_probs * self.N_SAMPLES
+
+        # Build a batch of N identical rows.
+        batch = logits_one.expand(self.N_SAMPLES, self.VOCAB).contiguous()
+        k_batch = (
+            torch.full((self.N_SAMPLES,), topk, dtype=torch.int32)
+            if topk is not None
+            else None
+        )
+        p_batch = (
+            torch.full((self.N_SAMPLES,), topp, dtype=torch.float32)
+            if topp is not None
+            else None
+        )
+        temp_batch = torch.full((self.N_SAMPLES,), temperature, dtype=torch.float32)
+
+        # FlashInfer dispatch path.
+        fi_tokens = flashinfer_sample(
+            batch.contiguous(), k_batch, p_batch, {}, temp_batch
+        )
+        fi_counts = torch.bincount(fi_tokens, minlength=self.VOCAB).cpu().numpy()
+        self._chi2_check(
+            fi_counts,
+            expected_counts,
+            chisquare,
+            label=f"fused-temp T={temperature} top-k={topk} top-p={topp}",
+        )
+
     def _chi2_check(self, empirical, expected, chisquare_fn, *, label):
         import numpy as np
 

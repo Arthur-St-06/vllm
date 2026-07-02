@@ -448,3 +448,30 @@ def test_sampler_bad_words(
                 assert logits_for_req[token_id] == -float("inf")
             else:
                 assert logits_for_req[token_id] != -float("inf")
+
+
+def test_can_defer_temperature():
+    """Gate logic for deferring temperature into the FlashInfer sampler."""
+    from types import SimpleNamespace
+
+    from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
+
+    sampler = Sampler()
+    sampler.topk_topp_sampler.supports_fused_temperature = True
+
+    # The gate reads only metadata.logitsprocs.argmax_invariant, so a
+    # SimpleNamespace stub keeps this test device-free.
+    def metadata(processors):
+        return SimpleNamespace(
+            logitsprocs=SimpleNamespace(argmax_invariant=processors)
+        )
+
+    idle_min_p = MinPLogitsProcessor.__new__(MinPLogitsProcessor)
+    idle_min_p.min_p_count = 0
+    active_min_p = MinPLogitsProcessor.__new__(MinPLogitsProcessor)
+    active_min_p.min_p_count = 1
+
+    assert sampler._can_defer_temperature(metadata([idle_min_p]))
+    assert not sampler._can_defer_temperature(metadata([active_min_p]))
+    # Unknown (e.g. out-of-tree) argmax-invariant processor: never defer.
+    assert not sampler._can_defer_temperature(metadata([object()]))
