@@ -152,6 +152,7 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         skip_top_k_top_p: bool = False,
+        skip_temperature: bool = False,
     ) -> torch.Tensor:
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
@@ -180,9 +181,10 @@ class Sampler:
         )
 
         # Apply temperature in place.
-        self.sampling_states.apply_temperature(
-            logits, expanded_idx_mapping, idx_mapping_np
-        )
+        if not skip_temperature:
+            self.sampling_states.apply_temperature(
+                logits, expanded_idx_mapping, idx_mapping_np
+            )
 
         # Apply min_p in place.
         self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
@@ -205,15 +207,6 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        processed_logits = self.apply_sampling_params(
-            logits,
-            expanded_idx_mapping,
-            idx_mapping_np,
-            pos,
-            input_ids,
-            expanded_local_pos,
-            skip_top_k_top_p=True,
-        )
         top_k, top_p = self.sampling_states.get_top_k_top_p(
             expanded_idx_mapping, idx_mapping_np
         )
@@ -226,10 +219,34 @@ class Sampler:
             or self.sampling_states.any_greedy(idx_mapping_np)
             or self.sampling_states.any_explicit_seed(idx_mapping_np)
         )
+        # min_p must observe temperature-scaled logits, so it disables
+        # deferral. processed_logits is then unscaled, which is safe: it is
+        # only consumed for processed_logprobs, and that mode disables the
+        # FI sampler above.
+        defer_temperature = use_flashinfer and not self.sampling_states.any_min_p(
+            idx_mapping_np
+        )
+        processed_logits = self.apply_sampling_params(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+            skip_top_k_top_p=True,
+            skip_temperature=defer_temperature,
+        )
 
         # Sample the next token.
         if use_flashinfer:
-            sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
+            temperature = (
+                self.sampling_states.temperature.gpu[expanded_idx_mapping]
+                if defer_temperature
+                else None
+            )
+            sampled = flashinfer_sample(
+                processed_logits, top_k, top_p, temperature=temperature
+            ).to(torch.int64)
         else:
             processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
             sampled = gumbel_sample(

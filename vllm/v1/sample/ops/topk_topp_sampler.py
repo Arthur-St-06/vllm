@@ -473,6 +473,7 @@ def flashinfer_sample(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     generators: dict[int, torch.Generator] = {},  # noqa
+    temperature: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample from the logits using FlashInfer.
 
@@ -483,11 +484,28 @@ def flashinfer_sample(
     NOTE: The outputs of this function do not necessarily match the outputs of
     the `random_sample` function. It only guarantees that the outputs are
     statistically equivalent.
+
+    A non-``None`` ``temperature`` must be positive and not already
+    applied to ``logits``; the division is fused into FlashInfer's softmax.
     """
     import flashinfer
 
     assert not (k is None and p is None)
-    if k is None:
+    if temperature is not None:
+        probs = flashinfer.sampling.softmax(logits, temperature=temperature)
+        if k is None:
+            next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, p, deterministic=True
+            )
+        elif p is None:
+            next_token_ids = flashinfer.sampling.top_k_sampling_from_probs(
+                probs, k, deterministic=True
+            )
+        else:
+            next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, k, p, deterministic=True
+            )
+    elif k is None:
         # Top-p only.
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(
