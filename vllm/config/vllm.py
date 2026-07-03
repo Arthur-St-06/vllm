@@ -26,6 +26,7 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
+from vllm.utils.platform_utils import is_uva_available
 
 from .attention import AttentionConfig
 from .cache import CacheConfig
@@ -543,6 +544,14 @@ class VllmConfig:
         if not HAS_TRITON:
             logger.warning_once(
                 "Model Runner V2 requires Triton; using the V1 model runner instead."
+            )
+            return False
+
+        if not is_uva_available():
+            logger.warning_once(
+                "Model Runner V2 requires UVA (pinned memory), which is not "
+                "available on this platform (e.g. WSL2); using the V1 model "
+                "runner instead."
             )
             return False
 
